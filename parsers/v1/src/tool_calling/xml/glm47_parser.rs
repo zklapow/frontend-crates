@@ -558,15 +558,33 @@ impl jsonschema::Retrieve for NoExternalSchemas {
     }
 }
 
+/// Resource IDs change the context in which fragment references are resolved.
+fn has_nested_resource_scope(schema: &Value, root: &Value) -> bool {
+    let draft4_id = root
+        .get("$schema")
+        .and_then(Value::as_str)
+        .is_some_and(|draft| draft.contains("/draft-04/"))
+        && schema.get("id").is_some();
+    !std::ptr::eq(schema, root) && (schema.get("$id").is_some() || draft4_id)
+}
+
 /// Only a bounded, acyclic local schema is eligible for ambiguous conversion.
 /// Count the expanded traversal, not just unique nodes: repeated refs in an
 /// acyclic DAG can otherwise cause exponential validation work too.
 fn schema_is_bounded_local(root: &Value) -> bool {
+    #[derive(Clone, Copy)]
+    enum Position {
+        Schema,
+        SchemaMap,
+        SchemaArray,
+        Data,
+    }
     fn visit<'a>(
         value: &'a Value,
         root: &'a Value,
         path: &mut Vec<&'a Value>,
         remaining: &mut usize,
+        position: Position,
     ) -> bool {
         if *remaining == 0
             || path.len() >= 64
@@ -576,11 +594,11 @@ fn schema_is_bounded_local(root: &Value) -> bool {
         }
         *remaining -= 1;
         path.push(value);
-        let safe = match value {
-            Value::Object(object) => {
+        let safe = match (value, position) {
+            (Value::Object(object), Position::Schema) => {
                 // Nested resource scopes / dynamic refs need different reference
                 // resolution. Do not send them to a validator after this guard.
-                let supported_scope = (!object.contains_key("$id") || std::ptr::eq(value, root))
+                let supported_scope = !has_nested_resource_scope(value, root)
                     && !object.contains_key("$dynamicRef")
                     && !object.contains_key("$recursiveRef");
                 let reference_safe = match object.get("$ref") {
@@ -588,40 +606,84 @@ fn schema_is_bounded_local(root: &Value) -> bool {
                     Some(Value::String(reference)) => reference
                         .strip_prefix('#')
                         .and_then(|pointer| root.pointer(pointer))
-                        .is_some_and(|target| visit(target, root, path, remaining)),
+                        .is_some_and(|target| {
+                            visit(target, root, path, remaining, Position::Schema)
+                        }),
                     _ => false,
                 };
                 supported_scope
                     && reference_safe
-                    && object
-                        .values()
-                        .all(|child| visit(child, root, path, remaining))
+                    && object.iter().all(|(keyword, child)| {
+                        let position = match keyword.as_str() {
+                            "$defs" | "definitions" | "properties" | "patternProperties"
+                            | "dependentSchemas" | "dependencies" => Position::SchemaMap,
+                            "allOf" | "anyOf" | "oneOf" | "prefixItems" => Position::SchemaArray,
+                            "items" if child.is_array() => Position::SchemaArray,
+                            "items"
+                            | "additionalItems"
+                            | "additionalProperties"
+                            | "unevaluatedItems"
+                            | "unevaluatedProperties"
+                            | "contains"
+                            | "propertyNames"
+                            | "not"
+                            | "if"
+                            | "then"
+                            | "else"
+                            | "contentSchema" => Position::Schema,
+                            // Property-name maps and enum/const/examples/default
+                            // values are data, even if their keys spell "$ref".
+                            _ => Position::Data,
+                        };
+                        visit(child, root, path, remaining, position)
+                    })
             }
-            Value::Array(values) => values
+            (Value::Object(object), Position::SchemaMap) => object.values().all(|child| {
+                // Legacy dependencies can also contain arrays of property names.
+                let position = if child.is_array() {
+                    Position::Data
+                } else {
+                    Position::Schema
+                };
+                visit(child, root, path, remaining, position)
+            }),
+            (Value::Array(values), Position::SchemaArray) => values
                 .iter()
-                .all(|child| visit(child, root, path, remaining)),
+                .all(|child| visit(child, root, path, remaining, Position::Schema)),
+            (Value::Object(object), _) => object
+                .values()
+                .all(|child| visit(child, root, path, remaining, Position::Data)),
+            (Value::Array(values), _) => values
+                .iter()
+                .all(|child| visit(child, root, path, remaining, Position::Data)),
             _ => true,
         };
         path.pop();
         safe
     }
-    visit(root, root, &mut Vec::new(), &mut 2048)
+    visit(root, root, &mut Vec::new(), &mut 2048, Position::Schema)
 }
 
 /// Concrete types need no candidate disambiguation. Following a single chain
 /// keeps this fast path bounded, including cyclic or missing references.
 fn concrete_schema_type<'a>(mut schema: &'a Value, root: &'a Value) -> Option<&'a str> {
     for _ in 0..32 {
-        if (schema.get("$id").is_some() && !std::ptr::eq(schema, root))
+        if has_nested_resource_scope(schema, root)
             || schema.get("$dynamicRef").is_some()
             || schema.get("$recursiveRef").is_some()
         {
             return None;
         }
-        if let Some(kind) = schema.get("type").and_then(Value::as_str) {
-            return Some(kind);
+        if let Some(reference) = schema.get("$ref") {
+            // Draft-07 ignores ref siblings; newer drafts combine them. Let
+            // the validator decide whenever siblings could affect the result.
+            if schema.as_object()?.len() != 1 {
+                return None;
+            }
+            schema = root.pointer(reference.as_str()?.strip_prefix('#')?)?;
+        } else {
+            return schema.get("type").and_then(Value::as_str);
         }
-        schema = root.pointer(schema.get("$ref")?.as_str()?.strip_prefix('#')?)?;
     }
     None
 }
@@ -898,6 +960,57 @@ mod tests {
     }
 
     #[test]
+    fn keyword_named_properties_and_annotations_are_data() {
+        for key in ["$id", "$ref", "$dynamicRef", "$recursiveRef"] {
+            let mut properties = serde_json::Map::new();
+            properties.insert(key.into(), serde_json::json!({"type": "string"}));
+            properties.insert(
+                "value".into(),
+                serde_json::json!({"type": ["integer", "null"]}),
+            );
+            let schema = serde_json::json!({
+                "type": "object", "properties": properties, "examples": [{"$id": "test"}]
+            });
+            assert!(schema_is_bounded_local(&schema));
+            let parsed = parse_with_schema(schema, &[(key, "seven"), ("value", "7")]);
+            assert_eq!(parsed["value"], serde_json::json!(7));
+            assert_eq!(parsed[key], "seven");
+        }
+    }
+
+    #[test]
+    fn reference_siblings_follow_the_schema_draft() {
+        for (draft, expected) in [
+            ("http://json-schema.org/draft-07/schema#", Value::Null),
+            (
+                "https://json-schema.org/draft/2020-12/schema",
+                serde_json::json!("null"),
+            ),
+        ] {
+            let schema = serde_json::json!({
+                "$schema": draft, "type": "object",
+                "definitions": {"nullable": {"type": ["string", "null"]}},
+                "properties": {"value": {
+                    "$ref": "#/definitions/nullable", "type": "string"
+                }}
+            });
+            assert_eq!(
+                parse_with_schema(schema, &[("value", "null")])["value"],
+                expected
+            );
+        }
+        let schema = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
+            "definitions": {"int": {"type": "integer"}},
+            "properties": {"value": {"$ref": "#/definitions/int", "type": "string"}}
+        });
+        assert_eq!(
+            parse_with_schema(schema, &[("value", "7")]),
+            serde_json::json!({"value": 7})
+        );
+    }
+
+    #[test]
     fn parent_constraints_disambiguate_multiple_nullable_arguments() {
         let schema = serde_json::json!({
             "type": "object", "properties": {
@@ -1011,6 +1124,19 @@ mod tests {
         assert!(!schema_is_bounded_local(&nested_scope));
         assert_eq!(
             parse_with_schema(nested_scope, &[("value", "7")]),
+            serde_json::json!({"value": "7"})
+        );
+        let draft4_scope = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-04/schema#",
+            "definitions": {"value": {"type": "integer"}},
+            "properties": {"value": {
+                "id": "urn:inner", "definitions": {"value": {"type": "string"}},
+                "$ref": "#/definitions/value"
+            }}
+        });
+        assert!(!schema_is_bounded_local(&draft4_scope));
+        assert_eq!(
+            parse_with_schema(draft4_scope, &[("value", "7")]),
             serde_json::json!({"value": "7"})
         );
     }

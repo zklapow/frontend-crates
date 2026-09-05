@@ -204,6 +204,30 @@ class GlmStructuralTagTest(unittest.TestCase):
                                outputs=[xml], timeout=2)
         self.assertEqual({"value": "null"}, json.loads(result["parsed"][0]["calls"][0]["function"]["arguments"]))
 
+    def test_keyword_named_data_and_draft07_ref_siblings(self):
+        cases = []
+        for key in ("$id", "$ref"):
+            cases.append(({"type": "object", "properties": {
+                key: {"type": "string"}, "value": {"type": ["integer", "null"]}},
+                "required": [key, "value"], "additionalProperties": False},
+                {key: "seven", "value": "7"}, {key: "seven", "value": 7}))
+        cases.append(({"type": "object", "properties": {
+            "value": {"type": ["integer", "null"]}}, "examples": [{"$id": "test"}],
+            "required": ["value"], "additionalProperties": False},
+            {"value": "7"}, {"value": 7}))
+        cases.append(({"$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
+            "definitions": {"int": {"type": "integer"}},
+            "properties": {"value": {"$ref": "#/definitions/int", "type": "string"}},
+            "required": ["value"], "additionalProperties": False},
+            {"value": "7"}, {"value": 7}))
+        for schema, values, expected in cases:
+            xml = "<tool_call>record" + "".join(
+                f"<arg_key>{key}</arg_key><arg_value>{raw}</arg_value>"
+                for key, raw in values.items()) + "</tool_call>"
+            grammar, result = self.build(tools=[tool(name="record", schema=schema)], outputs=[xml])
+            self.accepts(grammar, xml)
+            self.assertEqual(expected, json.loads(result["parsed"][0]["calls"][0]["function"]["arguments"]))
+
     def test_json_looking_strings_and_refs_keep_their_declared_types(self):
         for value in ('[]', '{}', '"quoted"', 'null', '123', 'true', '&quot;', 'x &lt; y'):
             for property_schema in ({"type": "string"}, {"$ref": "#/$defs/text"}):
