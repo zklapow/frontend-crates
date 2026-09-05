@@ -69,14 +69,14 @@ class GlmStructuralTagTest(unittest.TestCase):
         )
         cls.compiler = xgr.GrammarCompiler(xgr.TokenizerInfo([]), cache_enabled=False)
 
-    def build(self, choice="auto", tools=None, reasoning=False, parallel=None, mode="auto", outputs=()):
+    def build(self, choice="auto", tools=None, reasoning=False, parallel=None, mode="auto", outputs=(), timeout=10):
         request = {
             "parser": "glm47", "tools": [tool()] if tools is None else tools,
             "tool_choice": choice, "starts_in_reasoning": reasoning,
             "parallel_tool_calls": parallel, "schema_mode": mode, "outputs": outputs,
         }
         result = subprocess.run([self.binary], input=json.dumps(request) + "\n",
-                                text=True, capture_output=True, check=True, timeout=10)
+                                text=True, capture_output=True, check=True, timeout=timeout)
         response = json.loads(result.stdout)
         return self.compiler.compile_structural_tag(response["tag"]), response
 
@@ -158,6 +158,51 @@ class GlmStructuralTagTest(unittest.TestCase):
         self.assertEqual(1, len(calls))
         self.assertEqual(values, json.loads(calls[0]["function"]["arguments"]))
         self.accepts(grammar, xml.replace('{"ok": "yes"}', '{"ok": "yes", "extra": true}'), False)
+
+    def test_union_coercion_respects_constraints_not_just_types(self):
+        for prop, raw, expected in (
+            ({"type": ["string", "null"], "enum": ["null"]}, "null", "null"),
+            ({"type": ["string", "null"]}, "null", None),
+            ({"anyOf": [{"type": "integer", "minimum": 10},
+                        {"type": "string", "enum": ["7"]}]}, "7", "7"),
+            ({"anyOf": [{"type": "integer", "minimum": 10},
+                        {"type": "string", "enum": ["7"]}]}, "12", 12),
+            ({"oneOf": [{"type": "boolean", "const": False},
+                        {"type": "string", "enum": ["true"]}]}, "true", "true"),
+            ({"oneOf": [{"type": "boolean", "const": False},
+                        {"type": "string", "enum": ["true"]}]}, "false", False),
+            ({"anyOf": [{"type": "array", "minItems": 1, "items": {"type": "integer"}},
+                        {"type": "string", "enum": ["[]"]}]}, "[]", "[]"),
+            ({"anyOf": [{"type": "object", "properties": {"x": {"type": "integer"}},
+                        "required": ["x"], "additionalProperties": False},
+                        {"type": "string", "enum": ["{}"]}]}, "{}", "{}"),
+        ):
+            schema = {"type": "object", "properties": {"value": prop},
+                      "required": ["value"], "additionalProperties": False}
+            xml = f"<tool_call>record<arg_key>value</arg_key><arg_value>{raw}</arg_value></tool_call>"
+            grammar, result = self.build(tools=[tool(name="record", schema=schema)], outputs=[xml])
+            self.accepts(grammar, xml)
+            self.assertEqual({"value": expected}, json.loads(result["parsed"][0]["calls"][0]["function"]["arguments"]))
+
+    def test_recursive_reference_coercion_has_bounded_work(self):
+        for raw in ("hello", "null", "7"):
+            schema = {"type": "object", "properties": {"value": {"$ref": "#/$defs/node"}},
+                      "$defs": {"node": {"anyOf": [{"$ref": "#/$defs/node"}] * 3
+                                                + [{"type": "string"}]}}}
+            xml = f"<tool_call>record<arg_key>value</arg_key><arg_value>{raw}</arg_value></tool_call>"
+            _, result = self.build(tools=[tool(name="record", strict=False, schema=schema)],
+                                   outputs=[xml], timeout=2)
+            self.assertEqual({"value": raw}, json.loads(result["parsed"][0]["calls"][0]["function"]["arguments"]))
+        # Acyclic shared references can also expand exponentially.
+        definitions = {"node0": {"type": ["string", "null"]}}
+        for index in range(1, 16):
+            definitions[f"node{index}"] = {"anyOf": [{"$ref": f"#/$defs/node{index - 1}"}] * 3}
+        schema = {"type": "object", "properties": {"value": {"$ref": "#/$defs/node15"}},
+                  "$defs": definitions}
+        xml = "<tool_call>record<arg_key>value</arg_key><arg_value>null</arg_value></tool_call>"
+        _, result = self.build(tools=[tool(name="record", strict=False, schema=schema)],
+                               outputs=[xml], timeout=2)
+        self.assertEqual({"value": "null"}, json.loads(result["parsed"][0]["calls"][0]["function"]["arguments"]))
 
     def test_json_looking_strings_and_refs_keep_their_declared_types(self):
         for value in ('[]', '{}', '"quoted"', 'null', '123', 'true', '&quot;', 'x &lt; y'):
