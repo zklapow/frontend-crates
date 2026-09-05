@@ -487,6 +487,12 @@ fn decode_xml_entities(s: &str) -> String {
 fn coerce_value(raw: &str, schema_type: Option<&str>) -> ParsedValue {
     let trimmed = raw.trim();
 
+    // GLM strings are unquoted XML content, even when they look like JSON.
+    // Parsing `[]` or `"hello"` first changes the schema-declared string.
+    if schema_type == Some("string") {
+        return Value::String(raw.to_string()).into();
+    }
+
     // If the value already looks like JSON (object, array, or quoted string), parse it directly
     if (trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.starts_with('"'))
         && let Ok(v) = serde_json::from_str::<Value>(trimmed)
@@ -543,12 +549,74 @@ fn get_param_schema_type<'a>(
     tools: Option<&'a [ToolDefinition]>,
     function_name: &str,
     param_name: &str,
+    raw: &str,
 ) -> Option<&'a str> {
     let tool = tools?.iter().find(|t| t.name == function_name)?;
     let schema = tool.parameters.as_ref()?;
     let props = schema.get("properties")?;
     let param = props.get(param_name)?;
-    param.get("type")?.as_str()
+    schema_type_for_value(param, schema, raw, 0)
+}
+
+/// Resolve type hints through local refs and unions. This is conversion, not
+/// schema validation: guided decoding owns validation and malformed free output
+/// retains the existing fallback. Bound recursion for self-referencing schemas.
+fn schema_type_for_value<'a>(
+    schema: &'a Value,
+    root: &'a Value,
+    raw: &str,
+    depth: usize,
+) -> Option<&'a str> {
+    if depth >= 32 {
+        return None;
+    }
+    if let Some(reference) = schema.get("$ref").and_then(Value::as_str) {
+        return schema_type_for_value(
+            root.pointer(reference.strip_prefix('#')?)?,
+            root,
+            raw,
+            depth + 1,
+        );
+    }
+    if let Some(kind) = schema.get("type").and_then(Value::as_str) {
+        return Some(kind);
+    }
+    let parsed = serde_json::from_str::<Value>(raw.trim()).ok();
+    let matches_value = |kind: &str| match (kind, parsed.as_ref()) {
+        ("null", Some(Value::Null))
+        | ("boolean", Some(Value::Bool(_)))
+        | ("array", Some(Value::Array(_)))
+        | ("object", Some(Value::Object(_))) => true,
+        ("number", Some(Value::Number(_))) => true,
+        ("integer", Some(Value::Number(n))) => n.is_i64() || n.is_u64(),
+        _ => false,
+    };
+    if let Some(kinds) = schema.get("type").and_then(Value::as_array) {
+        return kinds
+            .iter()
+            .filter_map(Value::as_str)
+            .find(|kind| matches_value(kind))
+            .or_else(|| {
+                kinds
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .find(|kind| *kind == "string")
+            });
+    }
+    for union in ["anyOf", "oneOf"] {
+        if let Some(variants) = schema.get(union).and_then(Value::as_array) {
+            let types: Vec<_> = variants
+                .iter()
+                .filter_map(|variant| schema_type_for_value(variant, root, raw, depth + 1))
+                .collect();
+            return types
+                .iter()
+                .copied()
+                .find(|kind| matches_value(kind))
+                .or_else(|| types.iter().copied().find(|kind| *kind == "string"));
+        }
+    }
+    None
 }
 
 /// Parse a single GLM-4.7 tool call block
@@ -609,12 +677,16 @@ fn parse_tool_call_block(
         let raw_value = cap.get(2).map(|m| m.as_str()).unwrap_or("");
 
         if !key.is_empty() {
-            // Decode XML entities (e.g. &lt; → <, &amp; → &) before parsing
-            let decoded = decode_xml_entities(raw_value);
-
             // Look up the expected type from the tool's parameter schema
-            let schema_type = get_param_schema_type(tools, &function_name, key);
-            let json_value = coerce_value(&decoded, schema_type);
+            let schema_type = get_param_schema_type(tools, &function_name, key, raw_value);
+            let json_value = if schema_type.is_some() {
+                // xgrammar's glm_xml emits literal strings and JSON values;
+                // decoding entities here would mutate valid enum/const values.
+                coerce_value(raw_value, schema_type)
+            } else {
+                // Preserve the historical recovery for schema-less model output.
+                coerce_value(&decode_xml_entities(raw_value), None)
+            };
 
             arguments.insert(key.to_string(), json_value);
         }
@@ -644,6 +716,58 @@ mod tests {
 
     fn get_test_config() -> Glm47ParserConfig {
         Glm47ParserConfig::default()
+    }
+
+    #[test]
+    fn schema_constrained_strings_and_nullable_types_survive_parsing() {
+        for (schema, raw, expected) in [
+            (
+                serde_json::json!({"type": "string"}),
+                "[]",
+                serde_json::json!("[]"),
+            ),
+            (
+                serde_json::json!({"type": "string"}),
+                "\"quoted\"",
+                serde_json::json!("\"quoted\""),
+            ),
+            (
+                serde_json::json!({"type": "string"}),
+                "&quot;",
+                serde_json::json!("&quot;"),
+            ),
+            (
+                serde_json::json!({"type": ["string", "null"]}),
+                "null",
+                Value::Null,
+            ),
+            (
+                serde_json::json!({"anyOf": [{"type": "null"}, {"type": "integer"}]}),
+                "7",
+                serde_json::json!(7),
+            ),
+            (
+                serde_json::json!({"oneOf": [{"type": "null"}, {"type": "boolean"}]}),
+                "true",
+                serde_json::json!(true),
+            ),
+        ] {
+            let tools = [ToolDefinition {
+                name: "record".to_string(),
+                parameters: Some(
+                    serde_json::json!({"type": "object", "properties": {"value": schema}}),
+                ),
+                strict: Some(true),
+            }];
+            let text = format!(
+                "<tool_call>record<arg_key>value</arg_key><arg_value>{raw}</arg_value></tool_call>"
+            );
+            let (calls, _) =
+                try_tool_call_parse_glm47(&text, &get_test_config(), Some(&tools)).unwrap();
+            assert_eq!(calls.len(), 1);
+            let arguments: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(arguments["value"], expected);
+        }
     }
 
     #[test] // helper

@@ -12,6 +12,7 @@ use super::dsml::{self, DsmlToolCallsConfig};
 use super::format::{
     AnyTextFormat, AnyTokensFormat, Format, SequenceFormat, StructuralTag, TagFormat,
 };
+use super::glm47;
 use super::kimi_k2;
 use super::kimi_k3;
 use super::triggered_tags::{self, TriggeredTagsConfig};
@@ -119,6 +120,9 @@ pub enum StructuralTagBuilder {
     /// DeepSeek DSML format with a `triggered_tags` wrapper and invoke list.
     DsmlToolCalls(DsmlToolCallsConfig),
 
+    /// GLM-4.7/GLM-5 `<tool_call>` + `<arg_key>/<arg_value>` format.
+    Glm47,
+
     /// Kimi K2's native special-token tool-call section format.
     ///
     /// When generation starts in a prompt-injected reasoning block, this
@@ -149,6 +153,9 @@ impl StructuralTagBuilder {
             Self::DsmlToolCalls(config) => dsml::build_dsml_tool_calls(config, ctx)?,
             Self::KimiK2 => kimi_k2::build_kimi_k2(ctx)?,
             Self::KimiK3 => kimi_k3::build_kimi_k3(ctx)?,
+            // GLM builds its reasoning prefix for auto as well as forced calls,
+            // and owns the private xgrammar fields needed for token exclusions.
+            Self::Glm47 => return glm47::build_glm47(ctx),
         };
 
         structural_tag
@@ -215,6 +222,7 @@ impl StructuralTagBuilder {
         match self {
             Self::TriggeredTags(config) => &config.tool_call_ban_tokens,
             Self::DsmlToolCalls(config) => &config.tool_call_ban_tokens,
+            Self::Glm47 => glm47::TOOL_CALL_BAN_TOKENS.as_slice(),
             Self::KimiK2 => &[],
             Self::KimiK3 => &[],
         }
@@ -224,6 +232,7 @@ impl StructuralTagBuilder {
         match self {
             Self::TriggeredTags(config) => config.reasoning_end.as_deref(),
             Self::DsmlToolCalls(config) => config.reasoning_end.as_deref(),
+            Self::Glm47 => Some(glm47::THINK_END),
             // K2.5/K2.6 `kimi_k25` reasoning terminator. Original K2-Thinking
             // generates the opening `<think>` itself and needs a separate path.
             Self::KimiK2 => Some("</think>"),
