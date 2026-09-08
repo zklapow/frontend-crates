@@ -86,12 +86,12 @@ pub struct BasicReasoningParser {
     /// ends for every delimiter pair already; this flag only gates the
     /// streaming path so existing `<think>` stray-close stripping is preserved.
     recover_dangling_end: bool,
-    /// Whether a one-byte delimiter prefix should be buffered across chunks.
+    /// Whether a one-byte delimiter prefix should also be buffered outside reasoning.
     ///
-    /// The generic parser normally requires at least two matching bytes so a
-    /// lone `<` can flow directly into XML-like tool-call formats. Kimi K3's
-    /// reserved markers all begin with `<|`, so its configuration can safely
-    /// hold a trailing `<` for one chunk without changing other model families.
+    /// Inside reasoning, prefixes are always retained so a closing marker can
+    /// survive a chunk split. Outside reasoning, the default still lets a lone
+    /// `<` flow directly into XML-like tool-call formats. Kimi K3 opts into
+    /// retaining it there too because its reserved markers begin with `<|`.
     buffer_single_char_marker_prefix: bool,
     /// Whether a configured tool marker may still be the first visible
     /// boundary of prompt-prefilled reasoning.
@@ -143,9 +143,9 @@ impl BasicReasoningParser {
         self
     }
 
-    /// Buffer a one-byte prefix of a configured reasoning delimiter or exit
-    /// marker. Intended for formats whose reserved markers share an
-    /// unambiguous multi-byte prefix, such as Kimi K3's `<|...` markers.
+    /// Also buffer one-byte marker prefixes outside reasoning. They are already
+    /// retained inside reasoning. Intended for formats whose reserved markers
+    /// share an unambiguous multi-byte prefix, such as Kimi K3's `<|...` markers.
     pub fn with_single_char_marker_buffering(mut self) -> Self {
         self.buffer_single_char_marker_prefix = true;
         self
@@ -423,14 +423,12 @@ impl ReasoningParser for BasicReasoningParser {
                         let ol_end = overlap(&current_text, &self.think_end_token);
                         let ol_tool = max_marker_overlap(&current_text, &self.tool_start_tokens);
                         let ol = ol_end.max(ol_tool);
-                        // A one-byte think-marker overlap remains too ambiguous
-                        // (notably a lone `<` before ordinary tool XML), but a
-                        // configured tool marker must be preserved from its
-                        // first byte or the downstream parser can never recover it.
-                        if ol_end >= 2
-                            || ol_tool >= 1
-                            || (self.buffer_single_char_marker_prefix && ol == 1)
-                        {
+                        // Inside reasoning even the first byte of the close
+                        // marker must be retained. Emitting `<` from `</think>`
+                        // loses the boundary and swallows subsequent tool calls.
+                        // Outside reasoning the existing passthrough policy below
+                        // still allows tool XML to reach the downstream parser.
+                        if ol >= 1 {
                             let safe_end = current_text.len() - ol;
                             if safe_end > 0 {
                                 accumulated_reasoning.push_str(&current_text[..safe_end]);
