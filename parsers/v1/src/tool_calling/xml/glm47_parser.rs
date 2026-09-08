@@ -7,6 +7,7 @@
 
 use regex::Regex;
 use serde_json::Value;
+use std::cell::OnceCell;
 use std::collections::HashMap;
 use tracing::warn;
 use uuid::Uuid;
@@ -487,6 +488,11 @@ fn decode_xml_entities(s: &str) -> String {
 fn coerce_value(raw: &str, schema_type: Option<&str>) -> ParsedValue {
     let trimmed = raw.trim();
 
+    // GLM string arguments are unquoted, even when they look like JSON.
+    if schema_type == Some("string") {
+        return Value::String(raw.to_string()).into();
+    }
+
     // If the value already looks like JSON (object, array, or quoted string), parse it directly
     if (trimmed.starts_with('{') || trimmed.starts_with('[') || trimmed.starts_with('"'))
         && let Ok(v) = serde_json::from_str::<Value>(trimmed)
@@ -538,17 +544,288 @@ fn coerce_value(raw: &str, schema_type: Option<&str>) -> ParsedValue {
     Value::String(raw.to_string()).into()
 }
 
-/// Look up the JSON Schema type for a parameter by name from a tool's parameter schema.
-fn get_param_schema_type<'a>(
-    tools: Option<&'a [ToolDefinition]>,
-    function_name: &str,
-    param_name: &str,
-) -> Option<&'a str> {
-    let tool = tools?.iter().find(|t| t.name == function_name)?;
-    let schema = tool.parameters.as_ref()?;
-    let props = schema.get("properties")?;
-    let param = props.get(param_name)?;
-    param.get("type")?.as_str()
+/// Reject external resources even if resolver features are enabled downstream.
+struct NoExternalSchemas;
+
+impl jsonschema::Retrieve for NoExternalSchemas {
+    fn retrieve(
+        &self,
+        _uri: &jsonschema::Uri<String>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        Err("external schema retrieval is disabled for GLM argument conversion".into())
+    }
+}
+
+/// Resource IDs change the context in which fragment references are resolved.
+fn has_nested_resource_scope(schema: &Value, root: &Value) -> bool {
+    let draft4_id = root
+        .get("$schema")
+        .and_then(Value::as_str)
+        .is_some_and(|draft| draft.contains("/draft-04/"))
+        && schema.get("id").is_some();
+    !std::ptr::eq(schema, root) && (schema.get("$id").is_some() || draft4_id)
+}
+
+/// Bound expanded references: shared DAG nodes can multiply validation work.
+fn schema_is_bounded_local(root: &Value) -> bool {
+    #[derive(Clone, Copy)]
+    enum Position {
+        Schema,
+        SchemaMap,
+        SchemaArray,
+        Data,
+    }
+    fn visit<'a>(
+        value: &'a Value,
+        root: &'a Value,
+        path: &mut Vec<&'a Value>,
+        remaining: &mut usize,
+        position: Position,
+    ) -> bool {
+        if *remaining == 0
+            || path.len() >= 64
+            || path.iter().any(|previous| std::ptr::eq(*previous, value))
+        {
+            return false;
+        }
+        *remaining -= 1;
+        path.push(value);
+        let safe = match (value, position) {
+            (Value::Object(object), Position::Schema) => {
+                // This guard resolves only root-relative, static references.
+                let supported_scope = !has_nested_resource_scope(value, root)
+                    && !object.contains_key("$dynamicRef")
+                    && !object.contains_key("$recursiveRef");
+                let reference_safe = match object.get("$ref") {
+                    None => true,
+                    Some(Value::String(reference)) => reference
+                        .strip_prefix('#')
+                        .and_then(|pointer| root.pointer(pointer))
+                        .is_some_and(|target| {
+                            visit(target, root, path, remaining, Position::Schema)
+                        }),
+                    _ => false,
+                };
+                supported_scope
+                    && reference_safe
+                    && object.iter().all(|(keyword, child)| {
+                        let position = match keyword.as_str() {
+                            "$defs" | "definitions" | "properties" | "patternProperties"
+                            | "dependentSchemas" | "dependencies" => Position::SchemaMap,
+                            "allOf" | "anyOf" | "oneOf" | "prefixItems" => Position::SchemaArray,
+                            "items" if child.is_array() => Position::SchemaArray,
+                            "items"
+                            | "additionalItems"
+                            | "additionalProperties"
+                            | "unevaluatedItems"
+                            | "unevaluatedProperties"
+                            | "contains"
+                            | "propertyNames"
+                            | "not"
+                            | "if"
+                            | "then"
+                            | "else"
+                            | "contentSchema" => Position::Schema,
+                            // Annotation and literal values aren't schemas.
+                            _ => Position::Data,
+                        };
+                        visit(child, root, path, remaining, position)
+                    })
+            }
+            (Value::Object(object), Position::SchemaMap) => object.values().all(|child| {
+                // Legacy dependencies can also contain arrays of property names.
+                let position = if child.is_array() {
+                    Position::Data
+                } else {
+                    Position::Schema
+                };
+                visit(child, root, path, remaining, position)
+            }),
+            (Value::Array(values), Position::SchemaArray) => values
+                .iter()
+                .all(|child| visit(child, root, path, remaining, Position::Schema)),
+            (Value::Object(object), _) => object
+                .values()
+                .all(|child| visit(child, root, path, remaining, Position::Data)),
+            (Value::Array(values), _) => values
+                .iter()
+                .all(|child| visit(child, root, path, remaining, Position::Data)),
+            _ => true,
+        };
+        path.pop();
+        safe
+    }
+    visit(root, root, &mut Vec::new(), &mut 2048, Position::Schema)
+}
+
+/// Resolve a concrete type through a bounded chain of pure references.
+fn concrete_schema_type<'a>(mut schema: &'a Value, root: &'a Value) -> Option<&'a str> {
+    for _ in 0..32 {
+        if has_nested_resource_scope(schema, root)
+            || schema.get("$dynamicRef").is_some()
+            || schema.get("$recursiveRef").is_some()
+        {
+            return None;
+        }
+        if let Some(reference) = schema.get("$ref") {
+            // Defer ref siblings to draft-aware validation.
+            if schema.as_object()?.len() != 1 {
+                return None;
+            }
+            schema = root.pointer(reference.as_str()?.strip_prefix('#')?)?;
+        } else {
+            return schema.get("type").and_then(Value::as_str);
+        }
+    }
+    None
+}
+
+/// Cache validators per tool call, preserving the root reference context.
+struct ArgumentCoercion<'a> {
+    schema: Option<&'a Value>,
+    validators: OnceCell<Option<jsonschema::ValidatorMap>>,
+}
+
+impl ArgumentCoercion<'_> {
+    /// Resolve coupled property choices with a bounded candidate search.
+    fn reconcile_parent_constraints(
+        &self,
+        arguments: &mut HashMap<String, ParsedValue>,
+        raw_values: &HashMap<String, &str>,
+    ) {
+        let Some(map) = self.validators.get().and_then(Option::as_ref) else {
+            return;
+        };
+        let Some(validator) = map.get("#") else {
+            return;
+        };
+        let Ok(mut instance) = serde_json::to_value(&*arguments) else {
+            return;
+        };
+        if validator.is_valid(&instance) {
+            return;
+        }
+        let Some(root) = self.schema else {
+            return;
+        };
+        let mut alternatives = Vec::new();
+        for (key, raw) in raw_values {
+            let Some(property) = root.get("properties").and_then(|props| props.get(key)) else {
+                continue;
+            };
+            if concrete_schema_type(property, root).is_some() {
+                continue;
+            }
+            let Ok(parsed) = serde_json::from_str::<Value>(raw.trim()) else {
+                continue;
+            };
+            let pointer = format!(
+                "#{}",
+                jsonschema::paths::Location::new()
+                    .join("properties")
+                    .join(key.as_str())
+            );
+            let Some(property_validator) = map.get(&pointer) else {
+                continue;
+            };
+            let initial = instance[key].clone();
+            let other = [parsed, Value::String(raw.to_string())]
+                .into_iter()
+                .find(|value| value != &initial && property_validator.is_valid(value));
+            if let Some(other) = other {
+                alternatives.push((key.clone(), [initial, other]));
+            }
+        }
+        alternatives.sort_by(|left, right| left.0.cmp(&right.0));
+        fn search(
+            validator: &jsonschema::Validator,
+            instance: &mut Value,
+            alternatives: &[(String, [Value; 2])],
+            index: usize,
+            remaining: &mut usize,
+        ) -> bool {
+            if *remaining == 0 {
+                return false;
+            }
+            *remaining -= 1;
+            if index == alternatives.len() {
+                return validator.is_valid(instance);
+            }
+            let (key, values) = &alternatives[index];
+            for value in values {
+                instance[key] = value.clone();
+                if search(validator, instance, alternatives, index + 1, remaining) {
+                    return true;
+                }
+            }
+            false
+        }
+        let mut remaining = 256;
+        if alternatives.len() <= 32
+            && search(validator, &mut instance, &alternatives, 0, &mut remaining)
+        {
+            for (key, _) in alternatives {
+                arguments.insert(key.clone(), instance[&key].clone().into());
+            }
+        } else if remaining == 0 || alternatives.len() > 32 {
+            // Fall back rather than use a partially explored assignment.
+            for (key, _) in alternatives {
+                arguments.insert(
+                    key.clone(),
+                    coerce_value(&decode_xml_entities(raw_values[&key]), None),
+                );
+            }
+        }
+    }
+
+    fn coerce(&self, key: &str, raw: &str) -> ParsedValue {
+        let Some((root, property)) = self.schema.and_then(|root| {
+            root.get("properties")?
+                .get(key)
+                .map(|property| (root, property))
+        }) else {
+            return coerce_value(&decode_xml_entities(raw), None);
+        };
+        if let Some(kind) = concrete_schema_type(property, root) {
+            return coerce_value(raw, Some(kind));
+        }
+        let Ok(json_value) = serde_json::from_str::<Value>(raw.trim()) else {
+            return Value::String(raw.to_string()).into();
+        };
+        let validators = self.validators.get_or_init(|| {
+            if !schema_is_bounded_local(root) {
+                return None;
+            }
+            jsonschema::options()
+                .with_retriever(NoExternalSchemas)
+                .should_validate_formats(false)
+                .build_map(root)
+                .ok()
+        });
+        let pointer = format!(
+            "#{}",
+            jsonschema::paths::Location::new()
+                .join("properties")
+                .join(key)
+        );
+        if let Some(validator) = validators.as_ref().and_then(|map| map.get(&pointer)) {
+            let literal = Value::String(raw.to_string());
+            // GLM strings are unquoted; preserve literal quotes when valid.
+            let candidates = if json_value.is_string() {
+                [literal, json_value]
+            } else {
+                [json_value, literal]
+            };
+            if let Some(value) = candidates
+                .into_iter()
+                .find(|value| validator.is_valid(value))
+            {
+                return value.into();
+            }
+        }
+        // Keep legacy recovery for unsupported schemas or invalid free-form output.
+        coerce_value(&decode_xml_entities(raw), None)
+    }
 }
 
 /// Parse a single GLM-4.7 tool call block
@@ -603,22 +880,24 @@ fn parse_tool_call_block(
     );
 
     let regex = Regex::new(&pattern)?;
+    let mut raw_values = HashMap::new();
+    let coercion = ArgumentCoercion {
+        schema: tools
+            .and_then(|tools| tools.iter().find(|tool| tool.name == function_name))
+            .and_then(|tool| tool.parameters.as_ref()),
+        validators: OnceCell::new(),
+    };
 
     for cap in regex.captures_iter(args_section) {
         let key = cap.get(1).map(|m| m.as_str().trim()).unwrap_or("");
         let raw_value = cap.get(2).map(|m| m.as_str()).unwrap_or("");
 
         if !key.is_empty() {
-            // Decode XML entities (e.g. &lt; → <, &amp; → &) before parsing
-            let decoded = decode_xml_entities(raw_value);
-
-            // Look up the expected type from the tool's parameter schema
-            let schema_type = get_param_schema_type(tools, &function_name, key);
-            let json_value = coerce_value(&decoded, schema_type);
-
-            arguments.insert(key.to_string(), json_value);
+            raw_values.insert(key.to_string(), raw_value);
+            arguments.insert(key.to_string(), coercion.coerce(key, raw_value));
         }
     }
+    coercion.reconcile_parent_constraints(&mut arguments, &raw_values);
 
     // Validate function against tools if provided
     if let Some(tools_list) = tools {
@@ -644,6 +923,371 @@ mod tests {
 
     fn get_test_config() -> Glm47ParserConfig {
         Glm47ParserConfig::default()
+    }
+
+    fn parse_with_schema(schema: Value, values: &[(&str, &str)]) -> Value {
+        let tools = [ToolDefinition {
+            name: "record".to_string(),
+            parameters: Some(schema),
+            strict: Some(false),
+        }];
+        let mut raw = "<tool_call>record".to_string();
+        for (key, value) in values {
+            raw.push_str(&format!(
+                "<arg_key>{key}</arg_key><arg_value>{value}</arg_value>"
+            ));
+        }
+        raw.push_str("</tool_call>");
+        let (calls, _) = try_tool_call_parse_glm47(&raw, &get_test_config(), Some(&tools)).unwrap();
+        assert_eq!(calls.len(), 1);
+        serde_json::from_str(&calls[0].function.arguments).unwrap()
+    }
+
+    #[test]
+    fn keyword_named_properties_and_annotations_are_data() {
+        for key in ["$id", "$ref", "$dynamicRef", "$recursiveRef"] {
+            let mut properties = serde_json::Map::new();
+            properties.insert(key.into(), serde_json::json!({"type": "string"}));
+            properties.insert(
+                "value".into(),
+                serde_json::json!({"type": ["integer", "null"]}),
+            );
+            let schema = serde_json::json!({
+                "type": "object", "properties": properties, "examples": [{"$id": "test"}]
+            });
+            assert!(schema_is_bounded_local(&schema));
+            let parsed = parse_with_schema(schema, &[(key, "seven"), ("value", "7")]);
+            assert_eq!(parsed["value"], serde_json::json!(7));
+            assert_eq!(parsed[key], "seven");
+        }
+    }
+
+    #[test]
+    fn reference_siblings_follow_the_schema_draft() {
+        for (draft, expected) in [
+            ("http://json-schema.org/draft-07/schema#", Value::Null),
+            (
+                "https://json-schema.org/draft/2020-12/schema",
+                serde_json::json!("null"),
+            ),
+        ] {
+            let schema = serde_json::json!({
+                "$schema": draft, "type": "object",
+                "definitions": {"nullable": {"type": ["string", "null"]}},
+                "properties": {"value": {
+                    "$ref": "#/definitions/nullable", "type": "string"
+                }}
+            });
+            assert_eq!(
+                parse_with_schema(schema, &[("value", "null")])["value"],
+                expected
+            );
+        }
+        let schema = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#", "type": "object",
+            "definitions": {"int": {"type": "integer"}},
+            "properties": {"value": {"$ref": "#/definitions/int", "type": "string"}}
+        });
+        assert_eq!(
+            parse_with_schema(schema, &[("value", "7")]),
+            serde_json::json!({"value": 7})
+        );
+    }
+
+    #[test]
+    fn parent_constraints_disambiguate_multiple_nullable_arguments() {
+        let schema = serde_json::json!({
+            "type": "object", "properties": {
+                "left": {"type": ["string", "null"]},
+                "right": {"type": ["string", "null"]}
+            },
+            "allOf": [{"properties": {
+                "left": {"enum": ["null"]}, "right": {"const": null}
+            }}]
+        });
+        assert_eq!(
+            parse_with_schema(schema, &[("left", "null"), ("right", "null")]),
+            serde_json::json!({"left": "null", "right": null})
+        );
+    }
+
+    #[test]
+    fn escaped_property_names_and_local_reference_constraints_are_preserved() {
+        let schema = serde_json::json!({
+            "type": "object", "$defs": {
+                "value": {"type": ["string", "null"], "enum": ["null"]}
+            },
+            "properties": {
+                "a/b~c": {"$ref": "#/$defs/value"},
+                "snow 雪": {"$ref": "#/$defs/value"}
+            }
+        });
+        assert_eq!(
+            parse_with_schema(schema, &[("a/b~c", "null"), ("snow 雪", "null")]),
+            serde_json::json!({"a/b~c": "null", "snow 雪": "null"})
+        );
+    }
+
+    #[test]
+    fn cyclic_and_expansive_reference_graphs_do_not_enter_validation() {
+        let cyclic = serde_json::json!({
+            "$defs": {"node": {"anyOf": [
+                {"$ref": "#/$defs/node"}, {"$ref": "#/$defs/node"}, {"$ref": "#/$defs/node"},
+                {"type": "string"}
+            ]}}, "properties": {"value": {"$ref": "#/$defs/node"}}
+        });
+        assert!(!schema_is_bounded_local(&cyclic));
+        assert_eq!(
+            parse_with_schema(cyclic, &[("value", "null")]),
+            serde_json::json!({"value": "null"})
+        );
+        let mut definitions = serde_json::Map::new();
+        definitions.insert(
+            "node0".into(),
+            serde_json::json!({"type": ["string", "null"]}),
+        );
+        for index in 1..16 {
+            let reference = serde_json::json!({"$ref": format!("#/$defs/node{}", index - 1)});
+            definitions.insert(
+                format!("node{index}"),
+                serde_json::json!({"anyOf": [reference.clone(), reference.clone(), reference]}),
+            );
+        }
+        let expansive = serde_json::json!({"$defs": definitions,
+            "properties": {"value": {"$ref": "#/$defs/node15"}}});
+        assert!(!schema_is_bounded_local(&expansive));
+        assert_eq!(
+            parse_with_schema(expansive, &[("value", "7")]),
+            serde_json::json!({"value": "7"})
+        );
+    }
+
+    #[test]
+    fn candidate_cross_product_is_bounded() {
+        let properties: serde_json::Map<String, Value> = (0..33)
+            .map(|index| {
+                (
+                    format!("p{index}"),
+                    serde_json::json!({"type": ["string", "null"]}),
+                )
+            })
+            .collect();
+        let expected: serde_json::Map<String, Value> = properties
+            .keys()
+            .map(|key| (key.clone(), serde_json::json!("null")))
+            .collect();
+        let schema =
+            serde_json::json!({"type": "object", "properties": properties, "const": expected});
+        let keys: Vec<_> = expected.keys().map(String::as_str).collect();
+        let values: Vec<_> = keys.into_iter().map(|key| (key, "null")).collect();
+        assert_eq!(parse_with_schema(schema, &values), Value::Object(expected));
+    }
+
+    #[test]
+    fn schema_conversion_never_retrieves_external_resources() {
+        for reference in [
+            "https://example.invalid/schema",
+            "file:///not-a-schema.json",
+        ] {
+            let schema = serde_json::json!({"$ref": reference});
+            assert!(!schema_is_bounded_local(&schema));
+            assert!(
+                jsonschema::options()
+                    .with_retriever(NoExternalSchemas)
+                    .build(&schema)
+                    .is_err()
+            );
+        }
+        let nested_scope = serde_json::json!({
+            "$defs": {"value": {"type": "integer"}},
+            "properties": {"value": {
+                "$id": "urn:inner", "$defs": {"value": {"type": "string"}},
+                "$ref": "#/$defs/value"
+            }}
+        });
+        assert!(!schema_is_bounded_local(&nested_scope));
+        assert_eq!(
+            parse_with_schema(nested_scope, &[("value", "7")]),
+            serde_json::json!({"value": "7"})
+        );
+        let draft4_scope = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-04/schema#",
+            "definitions": {"value": {"type": "integer"}},
+            "properties": {"value": {
+                "id": "urn:inner", "definitions": {"value": {"type": "string"}},
+                "$ref": "#/definitions/value"
+            }}
+        });
+        assert!(!schema_is_bounded_local(&draft4_scope));
+        assert_eq!(
+            parse_with_schema(draft4_scope, &[("value", "7")]),
+            serde_json::json!({"value": "7"})
+        );
+    }
+
+    #[test]
+    fn json_looking_strings_keep_direct_and_referenced_string_types() {
+        for raw in [
+            "[]",
+            "{}",
+            "\"quoted\"",
+            "null",
+            "123",
+            "true",
+            "&quot;",
+            "x &lt; y",
+            "hello 中文",
+        ] {
+            for property in [
+                serde_json::json!({"type": "string"}),
+                serde_json::json!({"$ref": "#/$defs/text"}),
+            ] {
+                let schema = serde_json::json!({
+                    "type": "object", "$defs": {"text": {"type": "string"}},
+                    "properties": {"value": property}, "required": ["value"],
+                    "additionalProperties": false
+                });
+                assert_eq!(
+                    parse_with_schema(schema, &[("value", raw)]),
+                    serde_json::json!({"value": raw})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn primitive_nullable_and_nested_argument_types_survive_together() {
+        let schema = serde_json::json!({
+            "type": "object", "properties": {
+                "s": {"type": "string"}, "n": {"type": "integer"},
+                "b": {"type": "boolean"}, "nullable": {"type": ["string", "null"]},
+                "obj": {"type": "object", "properties": {"ok": {"enum": ["yes", "no"]}},
+                    "required": ["ok"], "additionalProperties": false},
+                "arr": {"type": "array", "items": {"type": "integer"}}
+            }, "required": ["s", "n", "b", "nullable", "obj", "arr"],
+            "additionalProperties": false
+        });
+        let values = [
+            ("s", "hello 中文"),
+            ("n", "7"),
+            ("b", "true"),
+            ("nullable", "null"),
+            ("obj", r#"{"ok":"yes"}"#),
+            ("arr", "[1,2]"),
+        ];
+        assert_eq!(
+            parse_with_schema(schema, &values),
+            serde_json::json!({
+                "s": "hello 中文", "n": 7, "b": true, "nullable": null,
+                "obj": {"ok": "yes"}, "arr": [1, 2]
+            })
+        );
+    }
+
+    #[test]
+    fn schema_constrained_strings_and_nullable_types_survive_parsing() {
+        for (schema, raw, expected) in [
+            (
+                serde_json::json!({"type": "string"}),
+                "[]",
+                serde_json::json!("[]"),
+            ),
+            (
+                serde_json::json!({"type": "string"}),
+                "\"quoted\"",
+                serde_json::json!("\"quoted\""),
+            ),
+            (
+                serde_json::json!({"type": "string"}),
+                "&quot;",
+                serde_json::json!("&quot;"),
+            ),
+            (
+                serde_json::json!({"type": ["string", "null"]}),
+                "null",
+                Value::Null,
+            ),
+            (
+                serde_json::json!({"type": ["string", "null"], "enum": ["null"]}),
+                "null",
+                serde_json::json!("null"),
+            ),
+            (
+                serde_json::json!({"anyOf": [
+                    {"type": "integer", "minimum": 10},
+                    {"type": "string", "enum": ["7"]}
+                ]}),
+                "7",
+                serde_json::json!("7"),
+            ),
+            (
+                serde_json::json!({"oneOf": [
+                    {"type": "boolean", "const": false},
+                    {"type": "string", "enum": ["true"]}
+                ]}),
+                "true",
+                serde_json::json!("true"),
+            ),
+            (
+                serde_json::json!({"anyOf": [
+                    {"type": "integer", "minimum": 10},
+                    {"type": "string", "enum": ["7"]}
+                ]}),
+                "12",
+                serde_json::json!(12),
+            ),
+            (
+                serde_json::json!({"oneOf": [
+                    {"type": "boolean", "const": false},
+                    {"type": "string", "enum": ["true"]}
+                ]}),
+                "false",
+                serde_json::json!(false),
+            ),
+            (
+                serde_json::json!({"anyOf": [
+                    {"type": "array", "minItems": 1, "items": {"type": "integer"}},
+                    {"type": "string", "enum": ["[]"]}
+                ]}),
+                "[]",
+                serde_json::json!("[]"),
+            ),
+            (
+                serde_json::json!({"anyOf": [
+                    {"type": "object", "properties": {"x": {"type": "integer"}},
+                        "required": ["x"], "additionalProperties": false},
+                    {"type": "string", "enum": ["{}"]}
+                ]}),
+                "{}",
+                serde_json::json!("{}"),
+            ),
+            (
+                serde_json::json!({"anyOf": [{"type": "null"}, {"type": "integer"}]}),
+                "7",
+                serde_json::json!(7),
+            ),
+            (
+                serde_json::json!({"oneOf": [{"type": "null"}, {"type": "boolean"}]}),
+                "true",
+                serde_json::json!(true),
+            ),
+        ] {
+            let tools = [ToolDefinition {
+                name: "record".to_string(),
+                parameters: Some(
+                    serde_json::json!({"type": "object", "properties": {"value": schema}}),
+                ),
+                strict: Some(true),
+            }];
+            let text = format!(
+                "<tool_call>record<arg_key>value</arg_key><arg_value>{raw}</arg_value></tool_call>"
+            );
+            let (calls, _) =
+                try_tool_call_parse_glm47(&text, &get_test_config(), Some(&tools)).unwrap();
+            assert_eq!(calls.len(), 1);
+            let arguments: Value = serde_json::from_str(&calls[0].function.arguments).unwrap();
+            assert_eq!(arguments["value"], expected);
+        }
     }
 
     #[test] // helper
