@@ -86,12 +86,8 @@ pub struct BasicReasoningParser {
     /// ends for every delimiter pair already; this flag only gates the
     /// streaming path so existing `<think>` stray-close stripping is preserved.
     recover_dangling_end: bool,
-    /// Whether a one-byte delimiter prefix should also be buffered outside reasoning.
-    ///
-    /// Inside reasoning, prefixes are always retained so a closing marker can
-    /// survive a chunk split. Outside reasoning, the default still lets a lone
-    /// `<` flow directly into XML-like tool-call formats. Kimi K3 opts into
-    /// retaining it there too because its reserved markers begin with `<|`.
+    /// Also buffer one-byte prefixes outside reasoning.
+    /// Inside reasoning they are always buffered; outside, the default is passthrough.
     buffer_single_char_marker_prefix: bool,
     /// Whether a configured tool marker may still be the first visible
     /// boundary of prompt-prefilled reasoning.
@@ -143,9 +139,7 @@ impl BasicReasoningParser {
         self
     }
 
-    /// Also buffer one-byte marker prefixes outside reasoning. They are already
-    /// retained inside reasoning. Intended for formats whose reserved markers
-    /// share an unambiguous multi-byte prefix, such as Kimi K3's `<|...` markers.
+    /// Enable one-byte prefix buffering outside reasoning.
     pub fn with_single_char_marker_buffering(mut self) -> Self {
         self.buffer_single_char_marker_prefix = true;
         self
@@ -423,11 +417,7 @@ impl ReasoningParser for BasicReasoningParser {
                         let ol_end = overlap(&current_text, &self.think_end_token);
                         let ol_tool = max_marker_overlap(&current_text, &self.tool_start_tokens);
                         let ol = ol_end.max(ol_tool);
-                        // Inside reasoning even the first byte of the close
-                        // marker must be retained. Emitting `<` from `</think>`
-                        // loses the boundary and swallows subsequent tool calls.
-                        // Outside reasoning the existing passthrough policy below
-                        // still allows tool XML to reach the downstream parser.
+                        // Retain the first byte so a split closing marker remains recognizable.
                         if ol >= 1 {
                             let safe_end = current_text.len() - ol;
                             if safe_end > 0 {
