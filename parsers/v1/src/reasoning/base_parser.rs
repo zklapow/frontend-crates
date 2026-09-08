@@ -86,12 +86,8 @@ pub struct BasicReasoningParser {
     /// ends for every delimiter pair already; this flag only gates the
     /// streaming path so existing `<think>` stray-close stripping is preserved.
     recover_dangling_end: bool,
-    /// Whether a one-byte delimiter prefix should be buffered across chunks.
-    ///
-    /// The generic parser normally requires at least two matching bytes so a
-    /// lone `<` can flow directly into XML-like tool-call formats. Kimi K3's
-    /// reserved markers all begin with `<|`, so its configuration can safely
-    /// hold a trailing `<` for one chunk without changing other model families.
+    /// Also buffer one-byte prefixes outside reasoning.
+    /// Inside reasoning they are always buffered; outside, the default is passthrough.
     buffer_single_char_marker_prefix: bool,
     /// Whether a configured tool marker may still be the first visible
     /// boundary of prompt-prefilled reasoning.
@@ -143,9 +139,7 @@ impl BasicReasoningParser {
         self
     }
 
-    /// Buffer a one-byte prefix of a configured reasoning delimiter or exit
-    /// marker. Intended for formats whose reserved markers share an
-    /// unambiguous multi-byte prefix, such as Kimi K3's `<|...` markers.
+    /// Enable one-byte prefix buffering outside reasoning.
     pub fn with_single_char_marker_buffering(mut self) -> Self {
         self.buffer_single_char_marker_prefix = true;
         self
@@ -423,14 +417,8 @@ impl ReasoningParser for BasicReasoningParser {
                         let ol_end = overlap(&current_text, &self.think_end_token);
                         let ol_tool = max_marker_overlap(&current_text, &self.tool_start_tokens);
                         let ol = ol_end.max(ol_tool);
-                        // A one-byte think-marker overlap remains too ambiguous
-                        // (notably a lone `<` before ordinary tool XML), but a
-                        // configured tool marker must be preserved from its
-                        // first byte or the downstream parser can never recover it.
-                        if ol_end >= 2
-                            || ol_tool >= 1
-                            || (self.buffer_single_char_marker_prefix && ol == 1)
-                        {
+                        // Retain the first byte so a split closing marker remains recognizable.
+                        if ol >= 1 {
                             let safe_end = current_text.len() - ol;
                             if safe_end > 0 {
                                 accumulated_reasoning.push_str(&current_text[..safe_end]);
