@@ -3,13 +3,8 @@
 
 //! GLM-4.7/GLM-5 structural-tag builder.
 //!
-//! This mirrors xgrammar's `glm_4_7` built-in format used by vLLM's `glm47`
-//! parser. GLM serializes object properties as adjacent
-//! `<arg_key>/<arg_value>` pairs inside a `<tool_call>{name}` envelope.
-//!
-//! Port of the xgrammar `get_glm_4_7_structural_tag` grammar (Apache-2.0),
-//! revision b5048784c65f70ca20bc5fb640b06c84583b7a92, with Dynamo's documented
-//! schema-mode policy and `parallel_tool_calls=false` handling.
+//! Adapted from xgrammar's `get_glm_4_7_structural_tag` (Apache-2.0),
+//! revision b5048784c65f70ca20bc5fb640b06c84583b7a92.
 
 use super::builder::{ToolCallFormatBuildContext, resolve_tool_schema, resolve_tools_to_include};
 use crate::tool_calling::ToolChoice;
@@ -35,8 +30,7 @@ struct GlmStructuralTag {
 
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-// Keep GLM's extra wire fields private: adding fields to the public format
-// structs would break downstream struct literals for unrelated parsers.
+// Private wire types preserve public struct-literal compatibility.
 enum GlmFormat {
     Tag {
         begin: String,
@@ -146,14 +140,14 @@ mod tests {
     fn tools(strict: Option<bool>) -> Vec<ToolDefinition> {
         vec![
             ToolDefinition {
-                name: "final_answer".to_string(),
+                name: "get_weather".to_string(),
                 parameters: Some(json!({
                     "type": "object",
                     "properties": {
-                        "reasoning": {"type": "string"},
-                        "ideas": {"type": "array", "items": {"type": "string"}}
+                        "location": {"type": "string"},
+                        "dates": {"type": "array", "items": {"type": "string"}}
                     },
-                    "required": ["reasoning", "ideas"],
+                    "required": ["location", "dates"],
                     "additionalProperties": false
                 })),
                 strict,
@@ -212,7 +206,7 @@ mod tests {
                 .unwrap()
                 .contains(&json!("</arg_value>"))
         );
-        assert_eq!(format["tags"][0]["begin"], "<tool_call>final_answer");
+        assert_eq!(format["tags"][0]["begin"], "<tool_call>get_weather");
         assert_eq!(format["tags"][0]["end"], "</tool_call>");
         assert_eq!(format["tags"][0]["content"]["style"], "glm_xml");
         assert_eq!(

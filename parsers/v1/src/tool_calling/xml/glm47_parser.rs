@@ -488,8 +488,7 @@ fn decode_xml_entities(s: &str) -> String {
 fn coerce_value(raw: &str, schema_type: Option<&str>) -> ParsedValue {
     let trimmed = raw.trim();
 
-    // GLM strings are unquoted XML content, even when they look like JSON.
-    // Parsing `[]` or `"hello"` first changes the schema-declared string.
+    // GLM string arguments are unquoted, even when they look like JSON.
     if schema_type == Some("string") {
         return Value::String(raw.to_string()).into();
     }
@@ -545,8 +544,7 @@ fn coerce_value(raw: &str, schema_type: Option<&str>) -> ParsedValue {
     Value::String(raw.to_string()).into()
 }
 
-/// A schema is request data, never permission to fetch files or network URLs.
-/// Keep this explicit even if a downstream crate enables resolver features.
+/// Reject external resources even if resolver features are enabled downstream.
 struct NoExternalSchemas;
 
 impl jsonschema::Retrieve for NoExternalSchemas {
@@ -568,9 +566,7 @@ fn has_nested_resource_scope(schema: &Value, root: &Value) -> bool {
     !std::ptr::eq(schema, root) && (schema.get("$id").is_some() || draft4_id)
 }
 
-/// Only a bounded, acyclic local schema is eligible for ambiguous conversion.
-/// Count the expanded traversal, not just unique nodes: repeated refs in an
-/// acyclic DAG can otherwise cause exponential validation work too.
+/// Bound expanded references: shared DAG nodes can multiply validation work.
 fn schema_is_bounded_local(root: &Value) -> bool {
     #[derive(Clone, Copy)]
     enum Position {
@@ -596,8 +592,7 @@ fn schema_is_bounded_local(root: &Value) -> bool {
         path.push(value);
         let safe = match (value, position) {
             (Value::Object(object), Position::Schema) => {
-                // Nested resource scopes / dynamic refs need different reference
-                // resolution. Do not send them to a validator after this guard.
+                // This guard resolves only root-relative, static references.
                 let supported_scope = !has_nested_resource_scope(value, root)
                     && !object.contains_key("$dynamicRef")
                     && !object.contains_key("$recursiveRef");
@@ -631,8 +626,7 @@ fn schema_is_bounded_local(root: &Value) -> bool {
                             | "then"
                             | "else"
                             | "contentSchema" => Position::Schema,
-                            // Property-name maps and enum/const/examples/default
-                            // values are data, even if their keys spell "$ref".
+                            // Annotation and literal values aren't schemas.
                             _ => Position::Data,
                         };
                         visit(child, root, path, remaining, position)
@@ -664,8 +658,7 @@ fn schema_is_bounded_local(root: &Value) -> bool {
     visit(root, root, &mut Vec::new(), &mut 2048, Position::Schema)
 }
 
-/// Concrete types need no candidate disambiguation. Following a single chain
-/// keeps this fast path bounded, including cyclic or missing references.
+/// Resolve a concrete type through a bounded chain of pure references.
 fn concrete_schema_type<'a>(mut schema: &'a Value, root: &'a Value) -> Option<&'a str> {
     for _ in 0..32 {
         if has_nested_resource_scope(schema, root)
@@ -675,8 +668,7 @@ fn concrete_schema_type<'a>(mut schema: &'a Value, root: &'a Value) -> Option<&'
             return None;
         }
         if let Some(reference) = schema.get("$ref") {
-            // Draft-07 ignores ref siblings; newer drafts combine them. Let
-            // the validator decide whenever siblings could affect the result.
+            // Defer ref siblings to draft-aware validation.
             if schema.as_object()?.len() != 1 {
                 return None;
             }
@@ -688,17 +680,14 @@ fn concrete_schema_type<'a>(mut schema: &'a Value, root: &'a Value) -> Option<&'
     None
 }
 
-/// Compile at most once per tool call, and only when a JSON-looking argument
-/// has no concrete type. Preserve each property's original root/ref context.
+/// Cache validators per tool call, preserving the root reference context.
 struct ArgumentCoercion<'a> {
     schema: Option<&'a Value>,
     validators: OnceCell<Option<jsonschema::ValidatorMap>>,
 }
 
 impl ArgumentCoercion<'_> {
-    /// Parent constraints can couple otherwise valid property choices. Try only
-    /// the two representations present in GLM's wire format, with a fixed work
-    /// budget. Never recursively search an unbounded cross-product of unions.
+    /// Resolve coupled property choices with a bounded candidate search.
     fn reconcile_parent_constraints(
         &self,
         arguments: &mut HashMap<String, ParsedValue>,
@@ -779,8 +768,7 @@ impl ArgumentCoercion<'_> {
                 arguments.insert(key.clone(), instance[&key].clone().into());
             }
         } else if remaining == 0 || alternatives.len() > 32 {
-            // No unbounded search when schemas relate many ambiguous fields.
-            // Preserve legacy conversions rather than a partially explored choice.
+            // Fall back rather than use a partially explored assignment.
             for (key, _) in alternatives {
                 arguments.insert(
                     key.clone(),
@@ -822,9 +810,7 @@ impl ArgumentCoercion<'_> {
         );
         if let Some(validator) = validators.as_ref().and_then(|map| map.get(&pointer)) {
             let literal = Value::String(raw.to_string());
-            // GLM strings are unquoted: retain quote characters when the schema
-            // accepts them. For non-string JSON prefer the typed value, but only
-            // if ALL constraints (enum, const, anyOf, oneOf, bounds, etc.) hold.
+            // GLM strings are unquoted; preserve literal quotes when valid.
             let candidates = if json_value.is_string() {
                 [literal, json_value]
             } else {
@@ -837,9 +823,7 @@ impl ArgumentCoercion<'_> {
                 return value.into();
             }
         }
-        // This remains a tolerant model-output parser, not a second strict-mode
-        // enforcement layer. Unsafe/unsupported schemas and malformed free output
-        // retain the historical fallback, without recursive inference or retrieval.
+        // Keep legacy recovery for unsupported schemas or invalid free-form output.
         coerce_value(&decode_xml_entities(raw), None)
     }
 }

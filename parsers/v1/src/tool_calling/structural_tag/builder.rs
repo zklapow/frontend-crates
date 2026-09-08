@@ -153,8 +153,6 @@ impl StructuralTagBuilder {
             Self::DsmlToolCalls(config) => dsml::build_dsml_tool_calls(config, ctx)?,
             Self::KimiK2 => kimi_k2::build_kimi_k2(ctx)?,
             Self::KimiK3 => kimi_k3::build_kimi_k3(ctx)?,
-            // GLM builds its reasoning prefix for auto as well as forced calls,
-            // and owns the private xgrammar fields needed for token exclusions.
             Self::Glm47 => return glm47::build_glm47(ctx),
         };
 
