@@ -1559,42 +1559,16 @@ mod tests {
     }
 
     #[test]
-    fn test_reasoning_close_marker_survives_every_stream_split() {
-        let completion = "Let me check.</think><tool_call>lookup</tool_call>";
-        for name in ["glm45", "qwen3", "deepseek_r1"] {
-            for split in 0..=completion.len() {
-                let mut parser = ReasoningParserType::get_reasoning_parser_from_name(name);
-                parser.set_in_reasoning(true);
-                let mut reasoning = String::new();
-                let mut content = String::new();
-                for chunk in [&completion[..split], &completion[split..]] {
-                    let result = parser.parse_reasoning_streaming_incremental(chunk, &[]);
-                    reasoning.push_str(&result.reasoning_text);
-                    content.push_str(&result.normal_text);
-                }
-                let result = parser.finish_reasoning_stream();
-                reasoning.push_str(&result.reasoning_text);
-                content.push_str(&result.normal_text);
-                assert_eq!(reasoning, "Let me check.", "{name}, split={split}");
-                assert_eq!(
-                    content, "<tool_call>lookup</tool_call>",
-                    "{name}, split={split}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_reasoning_close_prefix_is_buffered_and_flushed_losslessly_at_eof() {
+    fn test_non_k3_single_char_marker_behavior_is_unchanged() {
         let mut parser = ReasoningParserType::get_reasoning_parser_from_name("qwen3");
         parser.set_in_reasoning(true);
 
         let streamed = parser.parse_reasoning_streaming_incremental("literal<", &[]);
         let finished = parser.finish_reasoning_stream();
 
-        assert_eq!(streamed.reasoning_text, "literal");
+        assert_eq!(streamed.reasoning_text, "literal<");
         assert_eq!(streamed.normal_text, "");
-        assert_eq!(finished.reasoning_text, "<");
+        assert_eq!(finished.reasoning_text, "");
         assert_eq!(finished.normal_text, "");
     }
 

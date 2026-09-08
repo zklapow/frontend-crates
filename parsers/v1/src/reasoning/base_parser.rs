@@ -423,12 +423,14 @@ impl ReasoningParser for BasicReasoningParser {
                         let ol_end = overlap(&current_text, &self.think_end_token);
                         let ol_tool = max_marker_overlap(&current_text, &self.tool_start_tokens);
                         let ol = ol_end.max(ol_tool);
-                        // Inside reasoning even the first byte of the close
-                        // marker must be retained. Emitting `<` from `</think>`
-                        // loses the boundary and swallows subsequent tool calls.
-                        // Outside reasoning the existing passthrough policy below
-                        // still allows tool XML to reach the downstream parser.
-                        if ol >= 1 {
+                        // A one-byte think-marker overlap remains too ambiguous
+                        // (notably a lone `<` before ordinary tool XML), but a
+                        // configured tool marker must be preserved from its
+                        // first byte or the downstream parser can never recover it.
+                        if ol_end >= 2
+                            || ol_tool >= 1
+                            || (self.buffer_single_char_marker_prefix && ol == 1)
+                        {
                             let safe_end = current_text.len() - ol;
                             if safe_end > 0 {
                                 accumulated_reasoning.push_str(&current_text[..safe_end]);
