@@ -1142,6 +1142,65 @@ mod tests {
     }
 
     #[test]
+    fn json_looking_strings_keep_direct_and_referenced_string_types() {
+        for raw in [
+            "[]",
+            "{}",
+            "\"quoted\"",
+            "null",
+            "123",
+            "true",
+            "&quot;",
+            "x &lt; y",
+            "hello 中文",
+        ] {
+            for property in [
+                serde_json::json!({"type": "string"}),
+                serde_json::json!({"$ref": "#/$defs/text"}),
+            ] {
+                let schema = serde_json::json!({
+                    "type": "object", "$defs": {"text": {"type": "string"}},
+                    "properties": {"value": property}, "required": ["value"],
+                    "additionalProperties": false
+                });
+                assert_eq!(
+                    parse_with_schema(schema, &[("value", raw)]),
+                    serde_json::json!({"value": raw})
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn primitive_nullable_and_nested_argument_types_survive_together() {
+        let schema = serde_json::json!({
+            "type": "object", "properties": {
+                "s": {"type": "string"}, "n": {"type": "integer"},
+                "b": {"type": "boolean"}, "nullable": {"type": ["string", "null"]},
+                "obj": {"type": "object", "properties": {"ok": {"enum": ["yes", "no"]}},
+                    "required": ["ok"], "additionalProperties": false},
+                "arr": {"type": "array", "items": {"type": "integer"}}
+            }, "required": ["s", "n", "b", "nullable", "obj", "arr"],
+            "additionalProperties": false
+        });
+        let values = [
+            ("s", "hello 中文"),
+            ("n", "7"),
+            ("b", "true"),
+            ("nullable", "null"),
+            ("obj", r#"{"ok":"yes"}"#),
+            ("arr", "[1,2]"),
+        ];
+        assert_eq!(
+            parse_with_schema(schema, &values),
+            serde_json::json!({
+                "s": "hello 中文", "n": 7, "b": true, "nullable": null,
+                "obj": {"ok": "yes"}, "arr": [1, 2]
+            })
+        );
+    }
+
+    #[test]
     fn schema_constrained_strings_and_nullable_types_survive_parsing() {
         for (schema, raw, expected) in [
             (
@@ -1184,6 +1243,39 @@ mod tests {
                 ]}),
                 "true",
                 serde_json::json!("true"),
+            ),
+            (
+                serde_json::json!({"anyOf": [
+                    {"type": "integer", "minimum": 10},
+                    {"type": "string", "enum": ["7"]}
+                ]}),
+                "12",
+                serde_json::json!(12),
+            ),
+            (
+                serde_json::json!({"oneOf": [
+                    {"type": "boolean", "const": false},
+                    {"type": "string", "enum": ["true"]}
+                ]}),
+                "false",
+                serde_json::json!(false),
+            ),
+            (
+                serde_json::json!({"anyOf": [
+                    {"type": "array", "minItems": 1, "items": {"type": "integer"}},
+                    {"type": "string", "enum": ["[]"]}
+                ]}),
+                "[]",
+                serde_json::json!("[]"),
+            ),
+            (
+                serde_json::json!({"anyOf": [
+                    {"type": "object", "properties": {"x": {"type": "integer"}},
+                        "required": ["x"], "additionalProperties": false},
+                    {"type": "string", "enum": ["{}"]}
+                ]}),
+                "{}",
+                serde_json::json!("{}"),
             ),
             (
                 serde_json::json!({"anyOf": [{"type": "null"}, {"type": "integer"}]}),

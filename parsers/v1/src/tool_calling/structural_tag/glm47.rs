@@ -229,6 +229,101 @@ mod tests {
     }
 
     #[test]
+    fn mixed_tool_strictness_respects_schema_mode() {
+        for loose_strict in [None, Some(false)] {
+            let mut tools = tools(loose_strict);
+            tools[0].strict = Some(true);
+            for mode in [
+                StructuralTagSchemaMode::Auto,
+                StructuralTagSchemaMode::Strict,
+            ] {
+                let tag = StructuralTagBuilder::Glm47
+                    .build_tool_call_format(&ToolCallFormatBuildContext {
+                        tool_choice: &ToolChoice::Auto,
+                        tools: &tools,
+                        parallel_tool_calls: None,
+                        schema_mode: mode,
+                        starts_in_reasoning: false,
+                    })
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    tag["format"]["tags"][0]["content"]["json_schema"],
+                    tools[0].parameters.as_ref().unwrap().clone()
+                );
+                let expected = if mode == StructuralTagSchemaMode::Strict {
+                    tools[1].parameters.clone().unwrap()
+                } else {
+                    json!(true)
+                };
+                assert_eq!(tag["format"]["tags"][1]["content"]["json_schema"], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_policy_applies_to_auto_and_required() {
+        let tools = tools(Some(true));
+        for choice in [ToolChoice::Auto, ToolChoice::Required] {
+            for parallel in [None, Some(true), Some(false)] {
+                let tag = build(&choice, &tools, false, parallel);
+                assert_eq!(tag["format"]["stop_after_first"], parallel == Some(false));
+                assert_eq!(
+                    tag["format"]["at_least_one"],
+                    matches!(choice, ToolChoice::Required)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn empty_and_invalid_tool_choices_follow_builder_contract() {
+        let tools = tools(Some(true));
+        let context = ToolCallFormatBuildContext {
+            tool_choice: &ToolChoice::None,
+            tools: &tools,
+            parallel_tool_calls: None,
+            schema_mode: StructuralTagSchemaMode::Auto,
+            starts_in_reasoning: false,
+        };
+        assert!(
+            StructuralTagBuilder::Glm47
+                .build_tool_call_format(&context)
+                .unwrap()
+                .is_none()
+        );
+        let empty_auto = ToolCallFormatBuildContext {
+            tool_choice: &ToolChoice::Auto,
+            tools: &[],
+            ..context
+        };
+        assert!(
+            StructuralTagBuilder::Glm47
+                .build_tool_call_format(&empty_auto)
+                .unwrap()
+                .is_none()
+        );
+        let empty_required = ToolCallFormatBuildContext {
+            tool_choice: &ToolChoice::Required,
+            ..empty_auto
+        };
+        assert!(
+            StructuralTagBuilder::Glm47
+                .build_tool_call_format(&empty_required)
+                .is_err()
+        );
+        let missing_named = ToolCallFormatBuildContext {
+            tool_choice: &ToolChoice::Named("missing".to_string()),
+            ..context
+        };
+        assert!(
+            StructuralTagBuilder::Glm47
+                .build_tool_call_format(&missing_named)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn required_and_named_preserve_choice_semantics() {
         let tools = tools(Some(true));
 
@@ -250,18 +345,28 @@ mod tests {
     #[test]
     fn reasoning_prefix_excludes_control_tokens_until_think_end() {
         let tools = tools(Some(true));
-        let tag = build(&ToolChoice::Auto, &tools, true, None);
-        let prefix = &tag["format"]["elements"][0];
-
-        assert_eq!(tag["format"]["type"], "sequence");
-        assert_eq!(prefix["type"], "tag");
-        assert_eq!(prefix["end"], "</think>");
-        assert!(
-            prefix["content"]["excludes"]
-                .as_array()
-                .unwrap()
-                .contains(&json!("<tool_call>"))
-        );
+        for choice in [
+            ToolChoice::Auto,
+            ToolChoice::Required,
+            ToolChoice::Named("lookup".into()),
+        ] {
+            let tag = build(&choice, &tools, true, None);
+            let prefix = &tag["format"]["elements"][0];
+            assert_eq!(tag["format"]["type"], "sequence");
+            assert_eq!(prefix["type"], "tag");
+            assert_eq!(prefix["end"], "</think>");
+            for marker in ["<think>", "</think>", "<tool_call>", "</tool_call>"]
+                .into_iter()
+                .chain(ARG_CONTROL_TOKENS.iter().copied())
+            {
+                assert!(
+                    prefix["content"]["excludes"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!(marker))
+                );
+            }
+        }
     }
 
     #[test]
